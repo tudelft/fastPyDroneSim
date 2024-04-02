@@ -26,6 +26,17 @@ GRAVITY = 9.80665
 
 ### data
 
+# todo list
+# 1. benchmark SIMD (and contiguous arrays)
+#     --> contiguity can save around half the time, even in simple cases
+# 2. benchmark np.jit called from np.cuda.jit
+#     --> nb.jit doesnt work with an error no one on the internet has seen
+#     --> calling nb.cuda.jit(..., device=True) from a Kernel works like a charm
+# 3. adapt sim for cuda
+# 4. make class to get G1/G2 from system parameters
+# 5. investiage why first run is slow in CUDA
+#     --> this happens when a function signature isnt passed
+
 # sim data
 N = 2048 # run N simulations in parallel
 dt = 0.002 # step time is dt seconds (forward Euler)
@@ -38,6 +49,7 @@ omegaMaxs = np.tile(np.array(
 taus = np.tile(np.array(
     [0.03, 0.03, 0.03, 0.03], dtype=np.float32), (N, 1)) \
     + np.random.random((N, 4)).astype(np.float32)*1e-3
+tausi = 1. / taus
 G1        = 1. / (4000.**2) * np.tile( np.array(
     [
         [0.,0.,0.,0.],
@@ -88,7 +100,7 @@ def dummy_decorator(f=None, *args, **kwargs):
         return decorator
 
 vectorize = lambda signature, map: nb.guvectorize(signature, map, target='parallel', nopython=True)
-jit = lambda signature: nb.jit(signature, nopython=True)
+jit = lambda signature: nb.jit(signature, nopython=True, fastmath=False)
 nb.set_num_threads(max(nb.config.NUMBA_DEFAULT_NUM_THREADS-4, 1))
 #jit = lambda signature: nb.cuda.jit(signature)
 
@@ -115,20 +127,20 @@ def step(xdot, dt, x):
     for i in range(x.size):
         x[i] = x[i] + dt * xdot[i]
 
-    n = sqrt(x[6]**2 + x[7]**2 + x[8]**2 + x[9]**2)
+    ni = 1. / sqrt(x[6]**2 + x[7]**2 + x[8]**2 + x[9]**2)
     for i in range(6,10):
-        x[i] /= n
+        x[i] *= ni
 
 @jit("void(i4,f4[:],f4[:],f4[:])")
 def motorDot(i, w, d, wDot):
     wmax = omegaMaxs[i]
-    tau = taus[i]
+    taui = tausi[i]
     #wDot[:] = (d*wmax - w) / tau
     for j in range(len(w)):
         d[j] = 0. if d[j] < 0. else 1. if d[j] > 1. else d[j] 
-        wDot[j] = (sqrt(d[j])*wmax[j] - w[j]) / tau[j]
+        wDot[j] = (sqrt(d[j])*wmax[j] - w[j]) * taui[j]
 
-@jit("void(i4,f4[:],f4[:],f4[:])")
+@jit("void(i4,f4[::1],f4[::1],f4[::1])")
 def forcesAndMoments(i, omega, omegaDot, fm):
     o2 = omega.copy()
     for j in range(omega.size):
@@ -136,20 +148,34 @@ def forcesAndMoments(i, omega, omegaDot, fm):
 
     fm[:] = G1[i] @ o2   +   G2[i] @ omegaDot
 
-@jit("void(f4[:],f4[:])")
+@jit("void(f4[::1], f4[::1], f4[::1])")
+def cross(u, v, w):
+    w[0] = u[1]*v[2] - u[2]*v[1]
+    w[1] = u[2]*v[0] - u[0]*v[2]
+    w[2] = u[0]*v[1] - u[1]*v[0]
+
+@jit("void(f4[::1],f4[::1])")
 def quatRotate(q, v):
-    w, x, y, z = q
+    #w, x, y, z = q
 
-    # Construct quaternion matrix --> unchecked chatGPT code now
-    rotM = np.array([
-        [1 - 2*(y**2 + z**2),   2*(x*y - w*z),         2*(x*z + w*y)],
-        [2*(x*y + w*z),         1 - 2*(x**2 + z**2),   2*(y*z - w*x)],
-        [2*(x*z - w*y),         2*(y*z + w*x),         1 - 2*(x**2 + y**2)]
-    ], dtype=np.float32)
+    ## Construct quaternion matrix --> unchecked chatGPT code now
+    #rotM = np.array([
+    #    [1 - 2*(y**2 + z**2),   2*(x*y - w*z),         2*(x*z + w*y)],
+    #    [2*(x*y + w*z),         1 - 2*(x**2 + z**2),   2*(y*z - w*x)],
+    #    [2*(x*z - w*y),         2*(y*z + w*x),         1 - 2*(x**2 + y**2)]
+    #], dtype=np.float32)
 
-    v[:] = rotM @ v
+    #v[:] = rotM @ v
 
-@jit("void(f4[:],f4[:],f4[:])")
+    # crazy algorithm due to Fabian Giesen (A faster quaternion-vector multiplication)
+    t  = np.empty(3, dtype=np.float32)
+    t2 = np.empty(3, dtype=np.float32)
+    cross(2*q[1:], v, t)
+    cross(q[1:], t, t2)
+
+    v[:] +=  q[0] * t  +  t2
+
+@jit("void(f4[::1],f4[::1],f4[::1])")
 def quatDot(q, O, qDot):
     Ox, Oy, Oz = O
     qw, qx, qy, qz = q
@@ -284,9 +310,10 @@ async def mainDebug():
     asyncio.create_task(coro)
     await asyncio.sleep(3)
 
+    d = np.zeros((N, 4), dtype=np.float32)
+
     i = 0
     while True:
-        d = np.zeros((N, 4), dtype=np.float32)
         Controller(0, x[0], d[0])
         Dot(0, x[0], d[0], xDot[0])
         step(xDot[0], dt, x[0])
