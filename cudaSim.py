@@ -38,12 +38,25 @@ GRAVITY = 9.80665
 # 5. investiage why first run is slow in CUDA
 #     --> this happens when a function signature isnt passed
 
+
 # sim data
-blocks = 128 # 128 seems best
-threads_per_block = 64 # 32 or 64 seems best --> 4096 or 8192 parallel simulations
-N = blocks*threads_per_block # run N simulations in parallel. At least 8192 for decent GPU utilization (RTX A1000)
 dt = 0.002 # step time is dt seconds (forward Euler)
 T = 10  # run for T seconds
+log_interval = 5   # log stat every couple of iterations. 0 == off
+# may run out of graphics RAM if N*iters too large or log-interval too low
+
+# on an RTX A1000 mobile workstation GPU, this works best
+if log_interval > 0:
+    blocks = 128 # 128 seems best. Must be multiple of 32 (?)
+    threads_per_block = 64 # depends on global memorty usage. Must be multiple of 64
+else:
+    blocks = 256
+    threads_per_block = 256
+
+# pre calc
+N = blocks*threads_per_block # run N simulations in parallel. At least 8192 for decent GPU utilization (RTX A1000)
+iters = int(T / dt)
+
 
 # drone data
 omegaMaxs = np.tile(np.array(
@@ -55,22 +68,22 @@ taus = np.tile(np.array(
 itaus = 1. / taus
 G1s        = 1. / (4000.**2) * np.tile( np.array(
     [
-        [0.,0.,0.,0.],
-        [0.,0.,0.,0.],
+#        [0.,0.,0.,0.],
+#        [0.,0.,0.,0.],
         [-8.,-8.,-8.,-8.],
         [-300.,-300.,300.,300.],
         [-200.,+200.,-200.,+200.],
         [-50.,+50.,+50.,-50.],
-    ], dtype=np.float32), (N,1,1)) + (np.random.random((N, 6, 4)).astype(np.float32) * 1e-8)
+    ], dtype=np.float32), (N,1,1)) + (np.random.random((N, 4, 4)).astype(np.float32) * 1e-8)
 G2s        = 1e-5 * np.tile(np.array(
     [
-        [0.,0.,0.,0.],
-        [0.,0.,0.,0.],
-        [0.,0.,0.,0.],
-        [0.,0.,0.,0.],
-        [0.,0.,0.,0.],
+#        [0.,0.,0.,0.],
+#        [0.,0.,0.,0.],
+#        [0.,0.,0.,0.],
+#        [0.,0.,0.,0.],
+#        [0.,0.,0.,0.],
         [-50.,+50.,+50.,-50.],
-    ], dtype=np.float32), (N,1,1)) + (np.random.random((N, 6, 4)).astype(np.float32) * 1e-5)
+    ], dtype=np.float32), (N,1,1)) + (np.random.random((N, 1, 4)).astype(np.float32) * 1e-5)
 
 # position setpoints
 grid_size = int(np.ceil(np.sqrt(N)))
@@ -84,8 +97,8 @@ vectors = np.column_stack((X.ravel(), Y.ravel(), -1.5*np.ones_like(X.ravel())))
 pSets = vectors[:N].astype(np.float32)
 
 # position controller gains (attitude/rate hardcoded for now, sorry)
-posP = 4*np.ones((N, 3), dtype=np.float32)
-velP = 2*np.ones((N, 3), dtype=np.float32)
+posPs = 2*np.ones((N, 3), dtype=np.float32)
+velPs = 2*np.ones((N, 3), dtype=np.float32)
 #velI = 0.1*np.ones((N, 3), dtype=np.float32) # not implemented yet
 #velIlimit = np.ones((N, 3), dtype=np.float32)
 #velEI = np.zeros((N, 3), dtype=np.float32)
@@ -105,23 +118,29 @@ def dummy_decorator(f=None, *args, **kwargs):
 #vectorize = lambda signature, map: nb.guvectorize(signature, map, target='parallel', nopython=True)
 #jit = lambda signature: nb.jit(signature, nopython=True, fastmath=False)
 #nb.set_num_threads(max(nb.config.NUMBA_DEFAULT_NUM_THREADS-4, 1))
+
 jit = lambda signature: nb.cuda.jit(signature, 
-                                    fastmath=True, device=True, inline=False)
+                                    fastmath=False, device=True, inline=False)
 kernel = lambda signature: nb.cuda.jit(signature,
-                                       fastmath=True, device=False)
+                                       fastmath=False, device=False)
 
-#vectorize = dummy_decorator
 #jit = dummy_decorator
+#kernel = dummy_decorator
 
 
-### precompute
-
-G1pinvs = np.linalg.pinv(G1s)
+### precompute control allocation (FIXME: should be a weighted pseudoinverse!!)
+G1pinvs = np.linalg.pinv(G1s) / (omegaMaxs*omegaMaxs)[:, :, np.newaxis]
 
 
 ### states
 xs = np.empty((N, 17), dtype=np.float32)
 xDots = np.zeros_like(xs, dtype=np.float32)
+if log_interval > 0:
+    xs_log = np.empty((int(iters / log_interval), N, 17), dtype=np.float32)
+    xs_log[:] = np.nan
+else:
+    xs_log = np.empty((1, N, 17), dtype=np.float32)
+    xs_log[:] = np.nan
 
 
 ### functions (f4 is shorthand for float32)
@@ -129,18 +148,25 @@ xDots = np.zeros_like(xs, dtype=np.float32)
 def motorDot(w, d, itau, wmax, wDot):
     #wDot[:] = (wc - w) / tau
     for j in range(4):
-        dLim = 0. if d[j] < 0. else 1. if d[j] > 1. else d[j] 
-        wDot[j] = (sqrt(dLim)*wmax[j] - w[j]) * itau[j]
+        #dLim = 0. if d[j] < 0. else 1. if d[j] > 1. else d[j]
+        #wDot[j] = (sqrt(dLim)*wmax[j] - w[j]) * itau[j]
+        wDot[j] = (sqrt( d[j] )*wmax[j] - w[j]) * itau[j]
 
-@jit("void(f4[:, ::1], f4[::1], f4[::1], i4)")
-def sgemv(A, x, b, add):
+@jit("void(f4[:, ::1], f4[::1], f4[::1])")
+def sgemv(A, x, b):
     # matrix-vector multiplication
     # no loop unrolling because we only know sizes at runtime... what gives
     for i in range(b.shape[0]):
-        if add:
-            b[i] += A[i, 0] * x[0]
-        else:
-            b[i] = A[i, 0] * x[0]
+        b[i] = A[i, 0] * x[0]
+        for j in range(1, x.shape[0]):
+            b[i] += A[i, j] * x[j]
+
+@jit("void(f4[:, ::1], f4[::1], f4[::1])")
+def sgemv_add(A, x, b):
+    # matrix-vector multiplication
+    # no loop unrolling because we only know sizes at runtime... what gives
+    for i in range(b.shape[0]):
+        b[i] += A[i, 0] * x[0]
 
         for j in range(1, x.shape[0]):
             b[i] += A[i, j] * x[j]
@@ -150,25 +176,22 @@ def forcesAndMoments(omega, omegaDot, G1, G2, fm, workspace):
     for j in range(4):
         workspace[j] = omega[j]*omega[j]
 
-    sgemv(G1, workspace, fm, False)
+    fm[0] = 0.
+    fm[1] = 0.
+    sgemv(G1, workspace[:4], fm[2:])
+    sgemv_add(G2, omegaDot, fm[5:])
 
-    #g2Term = np.empty(3, dtype=np.float32)
-    sgemv(G2, omegaDot, fm[3:], True)
+@jit("void(f4[::1], f4[::1], f4[::1])")
+def cross(u, v, w):
+    w[0] = u[1]*v[2] - u[2]*v[1]
+    w[1] = u[2]*v[0] - u[0]*v[2]
+    w[2] = u[0]*v[1] - u[1]*v[0]
 
-    #for j in range(3):
-    #    fm[3+j] = g2Term[j]
-
-
-@jit("void(f4[::1], f4[::1], f4[::1], i4)")
-def cross(u, v, w, add):
-    if add:
-        w[0] += u[1]*v[2] - u[2]*v[1]
-        w[1] += u[2]*v[0] - u[0]*v[2]
-        w[2] += u[0]*v[1] - u[1]*v[0]
-    else:
-        w[0] = u[1]*v[2] - u[2]*v[1]
-        w[1] = u[2]*v[0] - u[0]*v[2]
-        w[2] = u[0]*v[1] - u[1]*v[0]
+@jit("void(f4[::1], f4[::1], f4[::1])")
+def cross_add(u, v, w):
+    w[0] += u[1]*v[2] - u[2]*v[1]
+    w[1] += u[2]*v[0] - u[0]*v[2]
+    w[2] += u[0]*v[1] - u[1]*v[0]
 
 @jit("void(f4[::1], f4[::1], f4[::1])")
 def quatRotate(q, v, t):
@@ -177,11 +200,12 @@ def quatRotate(q, v, t):
     # v' = v  +  q[0] * cross(2*q[1:], v)  +  cross(q[1:], cross(2*q[1:], v))
     # v' = v  +  q[0] * 2*cross(q[1:], v)  +  cross(q[1:], 2*cross(q[1:], v))
 
-    cross(q[1:], v, t, False)
+    # 15 multiplications, 15 additions
+    cross(q[1:], v, t)
     for j in range(3):
-        t[j] *= 2.
+        t[j] += t[j]
 
-    cross(q[1:], t, v, True)
+    cross_add(q[1:], t, v)
     for j in range(3):
         v[j] += q[0] * t[j]
 
@@ -195,97 +219,170 @@ def quatDot(q, O, qDot):
     qDot[3] = .5 * ( Oz*qw + Oy*qx - Ox*qy)
 
 
-@kernel("void(f4[:, ::1], f4[:, ::1], f4[:, ::1], f4[:, ::1], f4[:, :, ::1], f4[:, :, ::1], f4[:, ::1], f4[:, ::1])")
-def step(x, d, itau, wmax, G1, G2, xdot, workspace):
+@kernel("void(f4[:, ::1], f4[:, ::1], f4[:, ::1], f4[:, ::1], f4[:, :, ::1], f4[:, :, ::1], f4, i4, f4[:, :, ::1])")
+def step(x, d, itau, wmax, G1, G2, dt, current_iter, x_log):
+#def step(x, d, itau, wmax, G1, G2, iters, x_log):
     i1 = cuda.grid(1)
 
-    #pos   = x[i1, 0:3]
-    #vel   = x[i1, 3:6]
-    q     = x[i1, 6:10]
-    Omega = x[i1, 10:13]
-    omega = x[i1, 13:17]
+    x_local = cuda.local.array(17, dtype=nb.float32)
+    for j in range(6,17):
+        x_local[j] = x[i1, j]
 
+    #pos   = x_local[0:3]
+    #vel   = x_local[3:6]
+    q     = x_local[6:10]
+    Omega = x_local[10:13]
+    omega = x_local[13:17]
+
+    xdot_local = cuda.local.array(17, dtype=nb.float32)
+    #posDot = xdot_local[0:3]
+    velDot = xdot_local[3:6]
+    qDot = xdot_local[6:10]
+    OmegaDot = xdot_local[10:13]
+    omegaDot = xdot_local[13:17]
+
+    # workspace needed for a few jit functions
+    work = cuda.local.array(4, dtype=nb.float32)
+
+    #%% motor forces
     # motor model
-    #omegaDot = np.empty(4, dtype=np.float32)
-    #omegaDot = cuda.device_array(4, dtype=np.float32)
-    motorDot(omega, d[i1], itau[i1], wmax[i1], xdot[i1, 13:17])
+    motorDot(omega, d[i1], itau[i1], wmax[i1], omegaDot)
 
-    # forces
-    #fm = np.zeros(6, dtype=np.float32)
-    forcesAndMoments( omega, xdot[i1, 13:17], G1[i1], G2[i1], xdot[i1, 3:6], workspace[i1, :6])
+    # forces and moments
+    fm = cuda.local.array(6, dtype=nb.float32)
+    forcesAndMoments( omega, omegaDot, G1[i1], G2[i1], fm, work[:4])
 
-    ## kinematics
-    #qDot = np.zeros(4, dtype=np.float32)
-    quatDot(q, Omega, xdot[i1, 6:10])
+    for j in range(3):
+        velDot[j] = fm[j] # still needs to be rotated, see next section
+        OmegaDot[j] = fm[j+3]
 
-    quatRotate(q, xdot[i1, 3:6], workspace[i1, :3])
-    xdot[i1, 5] += GRAVITY
+    #%% kinematics
+    quatRotate(q, velDot, work[:3])
+    velDot[2] += GRAVITY
 
-    ## step forward
-    for j in range(17):
-        x[i1, j] += dt * xdot[i1, j]
+    quatDot(q, Omega, qDot)
 
-    # normalize quaternion
-    ni = 1. / sqrt(x[i1, 6]**2 + x[i1, 7]**2 + x[i1, 8]**2 + x[i1, 9]**2)
-    for j in range(6,10):
-        x[i1, j] *= ni
+    #%% step forward
+    for j in range(0,3): # position
+        x[i1, j] += dt * x[i1, j+3]
+
+    for j in range(3,6): # velocity
+        x[i1, j] += dt * xdot_local[j]
+
+    # quaternion needs to be normalzied after stepping. do that efficiently
+    # without sqrt
+    qnorm2 = 0.
+    for j in range(4):
+        q[j] += dt * qDot[j]
+        #q[j] *= q[j]
+        qnorm2 += q[j]*q[j]
+
+    # q now contains the squares of each elements. Normalize these!
+    iqnorm = 1. / sqrt(qnorm2)
+    for j in range(4):
+        x[i1, j+6] = q[j] * iqnorm
+
+    for j in range(10,17): # Omega and omega
+        x[i1, j] += dt * xdot_local[j]
+
+    #%% save state
+    if log_interval > 0:
+        log_idx = current_iter // log_interval
+        for j in range(17):
+            x_log[log_idx, i1, j] = x[i1, j]
 
 
-#@vectorize([(nb.int32, nb.float32[:], nb.float32[:])],
-#                   '(),(states),(n)')
-#def Controller(i, x, d):
-#    pos = x[:3].copy()
-#    vel = x[3:6].copy()
-#
-#    velSp = posP[i]/velP[i] * (pSets[i] - pos)
-#    velE = velSp - vel
-#    #velEI[i][:] = np.clip(velEI[i] + velE, -velIlimit[i], velIlimit[i])
-#
-#    accSp = velP[i]*velE# + velI[i]*velEI[i]
-#
-#    qi = x[6:10].copy()
-#    qi[0] = -qi[0]
-#
-#    fsp = accSp - np.array([0, 0, GRAVITY], dtype=np.float32)
-#    quatRotate(qi, fsp)
-#
-#    fzsp = np.linalg.norm(fsp)
-#    if (abs(fzsp) < 1e-5):
-#        # we are supposed to be falling, don't control attitude
-#        tiltE = np.array([0., 0., 0.], dtype=np.float32)
-#        cosTilt = 1.
-#    else:
-#        fsp /= fzsp
-#
-#        tilt = np.array([-fsp[1], fsp[0], 0.], dtype=np.float32)
-#
-#        sinTilt = hypot(fsp[0], fsp[1])
-#        cosTilt = -fsp[2] # dot prodict 
-#        if (sinTilt < 1e-5):
-#            # either we are aligned with attitude set or 180deg away
-#            if (cosTilt > 0):
-#                # aligned
-#                tiltE = np.array([0., 0., 0.], dtype=np.float32)
-#            else:
-#                # 180 deg
-#                tiltE = np.array([np.pi, 0., 0.], dtype=np.float32)
-#        else:
-#            tiltE = tilt / sinTilt * acos(cosTilt)
-#
-#    OmegaSp = -200./20. * tiltE
-#    OmegaE = OmegaSp - x[10:13].copy()
-#    OmegaDotSp = 20. * OmegaE
-#
-#    fspBody = cosTilt * np.array([0., 0., -fzsp], dtype=np.float32)
-#    fspBody[2] = 0. if fspBody[2] > 0. else fspBody[2]
-#    v = np.array([fspBody[0], fspBody[1], fspBody[2],
-#                  OmegaDotSp[0], OmegaDotSp[1], OmegaDotSp[2]], dtype=np.float32)
-#    #G1u = G1u * omegaMaxs[i]**2
-#    #d[:] = np.linalg.pinv(G1u) @ v
-#    G1pinvu = G1pinv[i] / (omegaMaxs[i]*omegaMaxs[i])[:, np.newaxis]
-#    d[:] = G1pinvu @ v
-#    for j in range(len(d)):
-#        d[j] = 0. if d[j] < 0. else 1. if d[j] > 1. else d[j]
+@kernel("void(f4[:, ::1], f4[:, ::1], f4[:, ::1], f4[:, ::1], f4[:, ::1], f4[:, :, ::1], f4[:, ::1])")
+def controller(x, d, posPs, velPs, pSets, G1pinv, workspace):
+    i1 = cuda.grid(1)
+
+    pos = x[i1, 0:3]
+    vel = x[i1, 3:6]
+    qi  = x[i1, 6:10]
+    qi[0] = -qi[0]
+    Omega = x[i1, 10:13]
+
+    posP = posPs[i1]
+    velP = velPs[i1]
+    pSet = pSets[i1]
+
+    #%% position control
+    # calculate specific force setpoint forceSp to achieve stable position
+    forceSp = workspace[i1, :3]
+
+    # more better would be having an integrator, but I don't feel like making
+    # another state for that
+    for j in range(3):
+        # xy are controlled separately, which isn't nice, but easy to code
+        #                       |---  velocity set point ---|
+        forceSp[j] = velP[j] * ( ( posP[j] * (pSet[j] - pos[j]) ) - vel[j] )
+
+    #forceSp[0] = 0.
+    #forceSp[1] = 0.
+    #forceSp[2] = 0.
+
+    forceSp[2] -= GRAVITY
+
+    quatRotate(qi, forceSp, workspace[i1, 3:6])
+    x[i1, 6] = -x[i1, 6] # restore state... the things you do to save memory..
+
+    #%% attitude control
+    # Calculate rate derivative setpoint to steer towards commanded tilt.
+    # Conveniently forget about yaw
+    # tilt error is tilt_error_angle * cross(actual_tilt, commanded_tilt)
+    # but the singularities make computations a bit lengthy
+    tiltErr    = workspace[i1, 6:8] # roll pitch only
+
+    cosTilt = 1.
+    for j in range(2):
+        tiltErr[j] = 0.
+
+    fzsp = sqrt(forceSp[0]**2 + forceSp[1]**2 + forceSp[2]**2)
+    if (abs(fzsp) < 1e-5):
+        # we are supposed to be falling, don't control attitude
+        # ie leave tiltErr=0. and cosTilt=1.
+        pass
+    else:
+        ifzsp = 1. / fzsp
+        for j in range(3):
+            forceSp[j] *= ifzsp
+
+        sinTilt = hypot(forceSp[0], forceSp[1]) # cross product magnitude
+        cosTilt = -forceSp[2] # dot product 
+        if (sinTilt < 1e-5):
+            # either we are aligned with attitude set or 180deg away
+            if (cosTilt > 0):
+                # aligned, tiltErr stays 0
+                pass
+            else:
+                # 180 deg, lets use roll (index 0)
+                tiltErr[0] = -np.pi
+        else:
+            tiltAngleOverSinTilt = acos(cosTilt) / sinTilt
+            tiltErr[0] = +forceSp[1] * tiltAngleOverSinTilt
+            tiltErr[1] = -forceSp[0] * tiltAngleOverSinTilt
+
+    OmegaDotSp = workspace[i1, 11:14] # rotation setpoint roll pitch yaw
+    for j in range(2):
+        # hardcoded gains, oops
+        #                     |--- Rate setpoint ----------|
+        OmegaDotSp[j] = 20. * (10. * tiltErr[j] - Omega[j])
+    OmegaDotSp[2] = 0.
+
+    #%% NDI allocation
+    # pseudocontrols:
+    v = workspace[i1, 8:14]
+
+    v[0] = 0.
+    v[1] = 0.
+    v[2] = -cosTilt*fzsp # z-force
+    # v[3:6] already assigned because shared workspacememory with OmegaDotSp
+
+    #d[:] = G1pinv[i1] @ v
+    sgemv(G1pinv[i1], v, d[i1])
+    for j in range(4):
+        #d[i1, j] = 0. if d[i1, j] < 0. else 1. if d[i1, j] > 1. else d[i1, j]
+        d[i1, j] = 0.
 
 
 ### websocket stuff
@@ -341,11 +438,13 @@ async def start_server():
 #        print(i)
 #        await asyncio.sleep(0.1)
 
-ts = 0
+ds = np.random.random((N, 4)).astype(np.float32)
+#ds[:] = 0
+
+x0 = ( np.random.random((N, 17)).astype(np.float32) - 0.5 )
 
 async def main():
 #def main():
-    x0 = np.random.random((N, 17)).astype(np.float32) - 0.5
     #x0[:, :3] = 0.
     #x0[:, 3:6] = 0.
     #x0[:, 6] = 1.
@@ -355,52 +454,64 @@ async def main():
     #x0[:, 13:17] = 0.
 
     xs[:] = x0.copy()
-    workspaces = np.empty((N, 6), dtype=np.float32)
 
     coro = start_server()
     asyncio.create_task(coro)
     print("initialized websocket")
-    await asyncio.sleep(2)
+    await asyncio.sleep(1)
 
-
-    ds = np.random.random((N, 4)).astype(np.float32)
     d_ds = cuda.to_device(ds)
     d_xs = cuda.to_device(xs)
+    d_xs_log = cuda.to_device(xs_log)
     d_itaus = cuda.to_device(itaus)
     d_omegaMaxs = cuda.to_device(omegaMaxs)
     d_G1s = cuda.to_device(G1s)
     d_G2s = cuda.to_device(G2s)
-    d_xDots = cuda.to_device(xDots)
-    d_workspaces = cuda.to_device(workspaces)
+    #d_xDots = cuda.to_device(xDots)
+    #d_workspaces = cuda.to_device(workspaces)
 
-    global ts
+    #d_posPs = cuda.to_device(posPs)
+    #d_velPs = cuda.to_device(velPs)
+    #d_pSets = cuda.to_device(pSets)
+    #d_G1pinvs = cuda.to_device(G1pinvs)
+    cuda.synchronize()
+
+    iters = int(T / dt)
     ts = time()
-    for i in range(int(T / dt)):
-        #tStart = time()
+    #step[blocks,threads_per_block](d_xs, d_ds, d_itaus, d_omegaMaxs, d_G1s, d_G2s, d_xDots, d_workspaces, iters, d_xs_log)
+    #step[blocks,threads_per_block](d_xs, d_ds, d_itaus, d_omegaMaxs, d_G1s, d_G2s, iters, d_xs_log)
+    #cuda.synchronize()
+    for i in range(iters):
+        tStart = time()
 
-        #Controller(idxs, x, d)
-        #cuda.synchronize()
-
-        step[128,64](d_xs, d_ds, d_itaus, d_omegaMaxs, d_G1s, d_G2s, d_xDots, d_workspaces)
-        #step[128,64](d_xs, d_ds, d_itaus, d_omegaMaxs, d_G1s, d_G2s, d_xDots, d_workspaces)
+        step[blocks,threads_per_block](d_xs, d_ds, d_itaus, d_omegaMaxs, d_G1s, d_G2s, dt, i, d_xs_log)
+        #controller[blocks,threads_per_block](d_xs, d_ds, d_posPs, d_velPs, d_pSets, d_G1pinvs, d_workspaces)
 
         if ws is not None and not i % int(0.1/dt):
+            # visualize every 0.1 seconds
             xs[:] = d_xs.copy_to_host()
             j = 0
-            for xD in xs[:200].astype(np.float64):
-                data = {"id": j, "pos": list(xD[:3]), "quat": list(xD[6:10])}
-                #data = {"id": i, "pos": [1,2,3.], "quat": [1., 0., 0., 0.]}
-                j += 1;
-                await ws.send(json.dumps(data))
+            for xD in xs[::int(N/256+0.5)].astype(np.float64):
+                # plot a maximum of 256
+                if not np.isnan(xD).any():
+                    data = {"id": j, "pos": list(xD[:3]), "quat": list(xD[6:10])}
+                    #data = {"id": i, "pos": [1,2,3.], "quat": [1., 0., 0., 0.]}
+                    j += 1;
+                    await ws.send(json.dumps(data))
 
-        #dtReal = time() - tStart
-        #e = dt - dtReal
-        #sleep(max(e, 0))
+        dtReal = time() - tStart
+        e = dt - dtReal
+        #await asyncio.sleep(max(e, 0))
 
+    if log_interval > 0:
+        xs_log[:] = d_xs_log.copy_to_host()
+    
+    runtime = time() - ts
+    #ds[:] = d_ds.copy_to_host()
+    return runtime
 
 #asyncio.run(mainDebug())
-asyncio.run(main())
+runtime = asyncio.run(main())
 #main()
-runtime = time() - ts
 
-print(f"Achieved {N*T / dt / runtime / 1e6:.2f}M ticks per second.")
+print(f"Achieved {N*iters / runtime / 1e6:.2f}M ticks per second across {runtime:.3f} seconds.")

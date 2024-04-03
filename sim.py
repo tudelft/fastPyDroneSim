@@ -357,7 +357,7 @@ async def main():
     for i in range(int(T / dt)):
         tStart = time()
 
-        Controller(idxs, x, d)
+        #Controller(idxs, x, d)
         Dot(idxs, x, d, xDot)
         step(xDot, dt, x)
 

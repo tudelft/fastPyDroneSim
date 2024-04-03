@@ -25,12 +25,14 @@ LABEL maintainer="t.m.blaha@tudelft.nl"
 LABEL version="0.1"
 LABEL description="Serves static files and reloads the page on changes to them"
 
-WORKDIR /usr/app
-COPY ./static/package.json /usr/app
-RUN npm install
+WORKDIR /usr/
+RUN npm create vite app -- --template vanilla
 
-WORKDIR /usr/app/static
+WORKDIR /usr/app
+RUN npm install three
+
+RUN echo "export default { root:'static' }" > /usr/app/vite.config.js
 
 EXPOSE 5173
 
-CMD [ "npx","vite" ]
+CMD [ "npm", "run", "dev" ]

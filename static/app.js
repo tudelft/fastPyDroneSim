@@ -16,17 +16,37 @@
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
+import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
 
 class quadRotor {
     constructor(width, length, diameter) {
         const xs = [length, length, -length, -length];
         const ys = [-width, width, -width, width];
         const rotorGeo = new THREE.CircleGeometry( .5*diameter, 16 );
-
         const edges = new THREE.EdgesGeometry( rotorGeo ); 
         const mat = new THREE.LineBasicMaterial( { color: 0x000000 } );
 
+        const triangleGeometry = new THREE.BufferGeometry();
+        const vertices = new Float32Array ( [
+                    length*1.3, 0, 0,  // Top
+                    length*0.7, -width/4, 0, // Bottom left
+                    length*0.7, +width/4, 0,   // Bottom right
+        ] );
+        const indices = [
+            0,1,2, // top
+            0,2,1, // bottom (right hand rule)
+        ];
+
+        triangleGeometry.setIndex( indices );
+        triangleGeometry.setAttribute( 'position', new THREE.BufferAttribute( vertices, 3 ) );
+
+        const darkGreenMaterial = new THREE.MeshBasicMaterial({ color: 0x006400 });
+        const triangleMesh = new THREE.Mesh(triangleGeometry, darkGreenMaterial);
+
         this.obj = new THREE.Object3D();
+        this.obj.add(triangleMesh);
+
         var rotorLines = []
         for (let i = 0; i < 4; i++) {
             var line = new THREE.LineSegments(edges, mat);
@@ -50,12 +70,12 @@ class quadRotor {
     }
 }
 
-function dressUpScene(scene, camera) {
+export function dressUpScene(scene, camera) {
     // scene with white background
     scene.background = new THREE.Color(0xffffff);
 
     // ground plane grid in the xy-plane
-    const gd = new THREE.GridHelper( size=10, divisions=10 );
+    const gd = new THREE.GridHelper( 10, 10 );
     gd.rotation.x = -0.5*3.1415
     scene.add( gd );
 
@@ -71,12 +91,14 @@ function dressUpScene(scene, camera) {
     scene.add( xAxis ); scene.add( yAxis ); scene.add( zAxis );
 
     // camera, such that North East Down makes sense
-    camera.position.x = -6;
-    camera.position.y = 4;
-    camera.position.z = -3.5;
+    camera.up.set( 0, 0, -1 ); // for orbit controls to make sense
+    camera.position.x = -4;
+    camera.position.y = 3;
+    camera.position.z = -3;
     camera.setRotationFromEuler( new THREE.Euler(-110*3.1415/180, 0, 55 * 3.1415/180, 'ZYX'))
 
 }
+
 
 function updateVisualization(data) {
     if (!idList.includes(data.id)) {
@@ -92,6 +114,7 @@ function updateVisualization(data) {
 
 function animate() {
 	requestAnimationFrame( animate );
+    controls.update();
 	renderer.render( scene, camera );
 }
 
@@ -111,15 +134,29 @@ function startWebsocket() {
   socket.onclose = function(){
     // connection closed, discard old websocket and create a new one in 5s
     socket = null;
-    setTimeout(startWebsocket, 500);
+    //setTimeout(startWebsocket, 200);
   }
+
+  socket.onerror = function(err) {
+    //console.error('Socket encountered error: ', err.message, 'Closing socket');
+    socket.close();
+  };
+}
+
+function retryConnection() {
+    if ((socket === null) || (socket.readyState != 1)) {
+        console.log('(Re)trying WebSocket connection...');
+        startWebsocket();
+    }
+    setTimeout(retryConnection, 500);
 }
 
 
 var socket = null;
 var idList = []
 var craftList = []
-startWebsocket();
+//startWebsocket();
+retryConnection();
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera( 60, window.innerWidth / window.innerHeight, 0.1, 1000 );
@@ -131,4 +168,14 @@ const renderer = new THREE.WebGLRenderer();
 renderer.setSize( window.innerWidth, window.innerHeight );
 document.body.appendChild( renderer.domElement )
 
+const controls = new OrbitControls( camera, renderer.domElement );
+
 animate();
+
+document.addEventListener('keydown', function(event) {
+    // Check if the space bar is pressed
+    if (event.code === 'Space') {
+        // Reset OrbitControls state
+        controls.reset();
+    }
+});
