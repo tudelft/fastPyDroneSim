@@ -38,7 +38,7 @@ GRAVITY = 9.80665
 #     --> this happens when a function signature isnt passed
 
 # sim data
-N = 2048 # run N simulations in parallel
+N = 256 # run N simulations in parallel
 dt = 0.002 # step time is dt seconds (forward Euler)
 T = 10  # run for T seconds
 
@@ -81,7 +81,7 @@ vectors = np.column_stack((X.ravel(), Y.ravel(), -1.5*np.ones_like(X.ravel())))
 pSets = vectors[:N].astype(np.float32)
 
 # position controller gains (attitude/rate hardcoded for now, sorry)
-posP = 4*np.ones((N, 3), dtype=np.float32)
+posP = 2*np.ones((N, 3), dtype=np.float32)
 velP = 2*np.ones((N, 3), dtype=np.float32)
 #velI = 0.1*np.ones((N, 3), dtype=np.float32) # not implemented yet
 #velIlimit = np.ones((N, 3), dtype=np.float32)
@@ -110,7 +110,8 @@ nb.set_num_threads(max(nb.config.NUMBA_DEFAULT_NUM_THREADS-4, 1))
 
 ### precompute
 
-G1pinv = np.linalg.pinv(G1)
+#G1pinv = np.linalg.pinv(G1)
+G1pinv = np.linalg.pinv(G1) / (omegaMaxs*omegaMaxs)[:, :, np.newaxis]
 
 
 ### states
@@ -222,7 +223,7 @@ def Controller(i, x, d):
     pos = x[:3].copy()
     vel = x[3:6].copy()
 
-    velSp = posP[i]/velP[i] * (pSets[i] - pos)
+    velSp = posP[i] * (pSets[i] - pos)
     velE = velSp - vel
     #velEI[i][:] = np.clip(velEI[i] + velE, -velIlimit[i], velIlimit[i])
 
@@ -235,7 +236,7 @@ def Controller(i, x, d):
     quatRotate(qi, fsp)
 
     fzsp = np.linalg.norm(fsp)
-    if (abs(fzsp) < 1e-5):
+    if (fzsp < 1e-5):
         # we are supposed to be falling, don't control attitude
         tiltE = np.array([0., 0., 0.], dtype=np.float32)
         cosTilt = 1.
@@ -257,7 +258,7 @@ def Controller(i, x, d):
         else:
             tiltE = tilt / sinTilt * acos(cosTilt)
 
-    OmegaSp = -200./20. * tiltE
+    OmegaSp = -10. * tiltE
     OmegaE = OmegaSp - x[10:13].copy()
     OmegaDotSp = 20. * OmegaE
 
@@ -267,7 +268,7 @@ def Controller(i, x, d):
                   OmegaDotSp[0], OmegaDotSp[1], OmegaDotSp[2]], dtype=np.float32)
     #G1u = G1u * omegaMaxs[i]**2
     #d[:] = np.linalg.pinv(G1u) @ v
-    G1pinvu = G1pinv[i] / (omegaMaxs[i]*omegaMaxs[i])[:, np.newaxis]
+    G1pinvu = G1pinv[i]# / (omegaMaxs[i]*omegaMaxs[i])[:, np.newaxis]
     d[:] = G1pinvu @ v
     for j in range(len(d)):
         d[j] = 0. if d[j] < 0. else 1. if d[j] > 1. else d[j]
@@ -308,7 +309,7 @@ async def mainDebug():
 
     coro = start_server()
     asyncio.create_task(coro)
-    await asyncio.sleep(3)
+    await asyncio.sleep(1)
 
     d = np.zeros((N, 4), dtype=np.float32)
 
@@ -328,16 +329,20 @@ async def mainDebug():
 
 ts = 0
 
+from ipdb import set_trace
+
+np.random.seed(42)
+x0 = np.random.random((N, 17)).astype(np.float32) - 0.5
+
 async def main():
 #def main():
-    x0 = np.random.random((N, 17)).astype(np.float32) - 0.5
-    #x0[:, :3] = 0.
-    #x0[:, 3:6] = 0.
+    x0[:, :3] = 0.
+    x0[:, 3:6] = 0.
     #x0[:, 6] = 1.
     #x0[:, 7:10] = 0.
     x0[:, 6:10] /= np.linalg.norm(x0[:, 6:10], axis=1)[:, np.newaxis]
-    #x0[:, 10:13] = 0.
-    #x0[:, 13:17] = 0.
+    x0[:, 10:13] = 0.
+    x0[:, 13:17] = 0.
 
     x[:] = x0.copy()
     xDot = np.zeros_like(x, dtype=np.float32)
@@ -351,15 +356,17 @@ async def main():
     await asyncio.sleep(2)
 
     d = np.random.random((N, 4)).astype(np.float32)
+    d[:] = 0
 
     global ts
     ts = time()
     for i in range(int(T / dt)):
         tStart = time()
 
-        #Controller(idxs, x, d)
         Dot(idxs, x, d, xDot)
         step(xDot, dt, x)
+        Controller(idxs, x, d)
+        set_trace()
 
         if ws is not None and not i % int(0.1/dt):
             j = 0

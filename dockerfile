@@ -30,6 +30,7 @@ RUN npm create vite app -- --template vanilla
 
 WORKDIR /usr/app
 RUN npm install three
+RUN npm install stats.js
 
 RUN echo "export default { root:'static' }" > /usr/app/vite.config.js
 

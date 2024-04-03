@@ -55,6 +55,8 @@ else:
 
 # pre calc
 N = blocks*threads_per_block # run N simulations in parallel. At least 8192 for decent GPU utilization (RTX A1000)
+Nlog = 0 if log_interval == 0 else N / log_interval
+Nviz = 512
 iters = int(T / dt)
 
 
@@ -75,7 +77,7 @@ G1s        = 1. / (4000.**2) * np.tile( np.array(
         [-200.,+200.,-200.,+200.],
         [-50.,+50.,+50.,-50.],
     ], dtype=np.float32), (N,1,1)) + (np.random.random((N, 4, 4)).astype(np.float32) * 1e-8)
-G2s        = 1e-5 * np.tile(np.array(
+G2s        = 0* 1e-5 * np.tile(np.array(
     [
 #        [0.,0.,0.,0.],
 #        [0.,0.,0.,0.],
@@ -87,8 +89,8 @@ G2s        = 1e-5 * np.tile(np.array(
 
 # position setpoints
 grid_size = int(np.ceil(np.sqrt(N)))
-x_vals = np.linspace(-3, 3, grid_size)
-y_vals = np.linspace(-3, 3, grid_size)
+x_vals = np.linspace(-7, 7, grid_size)
+y_vals = np.linspace(-7, 7, grid_size)
 
 X, Y = np.meshgrid(x_vals, y_vals)
 
@@ -130,6 +132,7 @@ kernel = lambda signature: nb.cuda.jit(signature,
 
 ### precompute control allocation (FIXME: should be a weighted pseudoinverse!!)
 G1pinvs = np.linalg.pinv(G1s) / (omegaMaxs*omegaMaxs)[:, :, np.newaxis]
+#G1pinvs = np.linalg.pinv(G1s) / 4000 / 4000
 
 
 ### states
@@ -292,23 +295,28 @@ def step(x, d, itau, wmax, G1, G2, dt, current_iter, x_log):
             x_log[log_idx, i1, j] = x[i1, j]
 
 
-@kernel("void(f4[:, ::1], f4[:, ::1], f4[:, ::1], f4[:, ::1], f4[:, ::1], f4[:, :, ::1], f4[:, ::1])")
-def controller(x, d, posPs, velPs, pSets, G1pinv, workspace):
+@kernel("void(f4[:, ::1], f4[:, ::1], f4[:, ::1], f4[:, ::1], f4[:, ::1], f4[:, :, ::1])")
+def controller(x, d, posPs, velPs, pSets, G1pinv):
     i1 = cuda.grid(1)
 
-    pos = x[i1, 0:3]
-    vel = x[i1, 3:6]
-    qi  = x[i1, 6:10]
-    qi[0] = -qi[0]
-    Omega = x[i1, 10:13]
+    x_local = cuda.local.array(17, dtype=nb.float32)
+    for j in range(17):
+        x_local[j] = x[i1, j]
 
+    pos   = x_local[0:3]
+    vel   = x_local[3:6]
+    qi    = x_local[6:10]
+    qi[0] = -qi[0]
+    Omega = x_local[10:13]
+
+    # this could be faster if allocating local memory
     posP = posPs[i1]
     velP = velPs[i1]
     pSet = pSets[i1]
 
     #%% position control
     # calculate specific force setpoint forceSp to achieve stable position
-    forceSp = workspace[i1, :3]
+    forceSp = cuda.local.array(3, dtype=nb.float32)
 
     # more better would be having an integrator, but I don't feel like making
     # another state for that
@@ -323,22 +331,22 @@ def controller(x, d, posPs, velPs, pSets, G1pinv, workspace):
 
     forceSp[2] -= GRAVITY
 
-    quatRotate(qi, forceSp, workspace[i1, 3:6])
-    x[i1, 6] = -x[i1, 6] # restore state... the things you do to save memory..
+    workspace = cuda.local.array(3, dtype=nb.float32)
+    quatRotate(qi, forceSp, workspace)
 
     #%% attitude control
     # Calculate rate derivative setpoint to steer towards commanded tilt.
     # Conveniently forget about yaw
     # tilt error is tilt_error_angle * cross(actual_tilt, commanded_tilt)
     # but the singularities make computations a bit lengthy
-    tiltErr    = workspace[i1, 6:8] # roll pitch only
+    tiltErr = cuda.local.array(2, dtype=nb.float32) # roll pitch only
 
     cosTilt = 1.
     for j in range(2):
         tiltErr[j] = 0.
 
     fzsp = sqrt(forceSp[0]**2 + forceSp[1]**2 + forceSp[2]**2)
-    if (abs(fzsp) < 1e-5):
+    if (fzsp < 1e-5):
         # we are supposed to be falling, don't control attitude
         # ie leave tiltErr=0. and cosTilt=1.
         pass
@@ -362,27 +370,51 @@ def controller(x, d, posPs, velPs, pSets, G1pinv, workspace):
             tiltErr[0] = +forceSp[1] * tiltAngleOverSinTilt
             tiltErr[1] = -forceSp[0] * tiltAngleOverSinTilt
 
-    OmegaDotSp = workspace[i1, 11:14] # rotation setpoint roll pitch yaw
+    # control yaw to point foward at all times
+    yawRateSp = 0.
+    if (cosTilt > 0.):
+        # more of less upright, lets control yaw
+        # error angle is 90deg - angle(body_x, (0 1 0))
+        acosAngle = 2*qi[1]*qi[2] - 2*qi[3]*qi[0]
+        acosAngle = -1. if acosAngle < -1. else +1. if acosAngle > +1. else acosAngle
+        yawE = 0.5*np.pi - acos(acosAngle)
+
+        if (1 - 2*qi[2]*qi[2] - 2* qi[3]*qi[3]) < 0.:
+            # dot product of global x and body x is positive! We are looking
+            # backwards and the angle is relative to pi
+            if yawE >= 0.:
+                yawE = np.pi - yawE
+            else:
+                yawE = -np.pi - yawE
+
+        yawRateSp = -1 * cosTilt * yawE
+
+    # rate derivative setpoints
+    OmegaDotSp = cuda.local.array(3, dtype=nb.float32) # rotation setpoint roll pitch yaw
     for j in range(2):
         # hardcoded gains, oops
         #                     |--- Rate setpoint ----------|
         OmegaDotSp[j] = 20. * (10. * tiltErr[j] - Omega[j])
-    OmegaDotSp[2] = 0.
+
+    OmegaDotSp[2] = 20. * (yawRateSp - Omega[2])
 
     #%% NDI allocation
     # pseudocontrols:
-    v = workspace[i1, 8:14]
+    v = cuda.local.array(4, dtype=nb.float32)
 
-    v[0] = 0.
-    v[1] = 0.
-    v[2] = -cosTilt*fzsp # z-force
-    # v[3:6] already assigned because shared workspacememory with OmegaDotSp
+    if cosTilt > 0:
+        v[0] = -cosTilt*fzsp # z-force
+    else:
+        v[0] = 0.
+    v[1] = OmegaDotSp[0]
+    v[2] = OmegaDotSp[1]
+    v[3] = OmegaDotSp[2]
 
     #d[:] = G1pinv[i1] @ v
     sgemv(G1pinv[i1], v, d[i1])
     for j in range(4):
-        #d[i1, j] = 0. if d[i1, j] < 0. else 1. if d[i1, j] > 1. else d[i1, j]
-        d[i1, j] = 0.
+        d[i1, j] = 0. if d[i1, j] < 0. else 1. if d[i1, j] > 1. else d[i1, j]
+        #d[i1, j] = 0.
 
 
 ### websocket stuff
@@ -439,9 +471,11 @@ async def start_server():
 #        await asyncio.sleep(0.1)
 
 ds = np.random.random((N, 4)).astype(np.float32)
-#ds[:] = 0
 
-x0 = ( np.random.random((N, 17)).astype(np.float32) - 0.5 )
+from ipdb import set_trace
+
+#np.random.seed(42)
+x0 = np.random.random((N, 17)).astype(np.float32) - 0.5
 
 async def main():
 #def main():
@@ -460,6 +494,8 @@ async def main():
     print("initialized websocket")
     await asyncio.sleep(1)
 
+    tsAll = time()
+
     d_ds = cuda.to_device(ds)
     d_xs = cuda.to_device(xs)
     d_xs_log = cuda.to_device(xs_log)
@@ -467,51 +503,47 @@ async def main():
     d_omegaMaxs = cuda.to_device(omegaMaxs)
     d_G1s = cuda.to_device(G1s)
     d_G2s = cuda.to_device(G2s)
-    #d_xDots = cuda.to_device(xDots)
-    #d_workspaces = cuda.to_device(workspaces)
 
-    #d_posPs = cuda.to_device(posPs)
-    #d_velPs = cuda.to_device(velPs)
-    #d_pSets = cuda.to_device(pSets)
-    #d_G1pinvs = cuda.to_device(G1pinvs)
+    d_posPs = cuda.to_device(posPs)
+    d_velPs = cuda.to_device(velPs)
+    d_pSets = cuda.to_device(pSets)
+    d_G1pinvs = cuda.to_device(G1pinvs)
     cuda.synchronize()
 
-    iters = int(T / dt)
     ts = time()
-    #step[blocks,threads_per_block](d_xs, d_ds, d_itaus, d_omegaMaxs, d_G1s, d_G2s, d_xDots, d_workspaces, iters, d_xs_log)
-    #step[blocks,threads_per_block](d_xs, d_ds, d_itaus, d_omegaMaxs, d_G1s, d_G2s, iters, d_xs_log)
-    #cuda.synchronize()
+    iters = int(T / dt)
     for i in range(iters):
-        tStart = time()
+        #tStart = time()
 
         step[blocks,threads_per_block](d_xs, d_ds, d_itaus, d_omegaMaxs, d_G1s, d_G2s, dt, i, d_xs_log)
-        #controller[blocks,threads_per_block](d_xs, d_ds, d_posPs, d_velPs, d_pSets, d_G1pinvs, d_workspaces)
+        controller[blocks,threads_per_block](d_xs, d_ds, d_posPs, d_velPs, d_pSets, d_G1pinvs)
 
-        if ws is not None and not i % int(0.1/dt):
+        if ws is not None and not i % int(0.05/dt):
             # visualize every 0.1 seconds
             xs[:] = d_xs.copy_to_host()
             j = 0
-            for xD in xs[::int(N/256+0.5)].astype(np.float64):
+            for j, xD in enumerate(xs[::int(N/Nviz+0.5)].astype(np.float64)):
                 # plot a maximum of 256
                 if not np.isnan(xD).any():
                     data = {"id": j, "pos": list(xD[:3]), "quat": list(xD[6:10])}
-                    #data = {"id": i, "pos": [1,2,3.], "quat": [1., 0., 0., 0.]}
-                    j += 1;
                     await ws.send(json.dumps(data))
 
-        dtReal = time() - tStart
-        e = dt - dtReal
-        #await asyncio.sleep(max(e, 0))
+        #dtReal = time() - tStart
+        #e = dt - dtReal
+        #await asyncio.sleep(max(e, 0)/4)
+
+    cuda.synchronize()
+    runtime = time() - ts
 
     if log_interval > 0:
         xs_log[:] = d_xs_log.copy_to_host()
-    
-    runtime = time() - ts
-    #ds[:] = d_ds.copy_to_host()
-    return runtime
+
+    runtimeOverhead = time() - tsAll
+    return runtime, runtimeOverhead
 
 #asyncio.run(mainDebug())
-runtime = asyncio.run(main())
+runtime, runtimeOverhead = asyncio.run(main())
 #main()
 
-print(f"Achieved {N*iters / runtime / 1e6:.2f}M ticks per second across {runtime:.3f} seconds.")
+print(f"Achieved {N*iters / runtime / 1e6:.2f}M ticks per second (sim only) across {runtime:.6f} seconds.")
+print(f"Retrieved {Nlog*iters / runtimeOverhead / 1e6:.2f}M ticks per second across {runtimeOverhead:.3f} seconds.")

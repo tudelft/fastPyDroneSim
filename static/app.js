@@ -17,13 +17,15 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 import * as THREE from 'three';
-import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
+import { OrbitControls } from 'three/addons/controls/OrbitControls';
+import { ViewHelper } from 'three/addons/helpers/ViewHelper.js';
+import Stats from 'stats.js'
 
 class quadRotor {
     constructor(width, length, diameter) {
         const xs = [length, length, -length, -length];
         const ys = [-width, width, -width, width];
-        const rotorGeo = new THREE.CircleGeometry( .5*diameter, 16 );
+        const rotorGeo = new THREE.CircleGeometry( .5*diameter, 8 );
         const edges = new THREE.EdgesGeometry( rotorGeo ); 
         const mat = new THREE.LineBasicMaterial( { color: 0x000000 } );
 
@@ -70,41 +72,13 @@ class quadRotor {
     }
 }
 
-export function dressUpScene(scene, camera) {
-    // scene with white background
-    scene.background = new THREE.Color(0xffffff);
-
-    // ground plane grid in the xy-plane
-    const gd = new THREE.GridHelper( 10, 10 );
-    gd.rotation.x = -0.5*3.1415
-    scene.add( gd );
-
-    // coordinate vectors (RGB --> XYZ (north-east-down))
-    const xdir = new THREE.Vector3( 1, 0, 0 );
-    const ydir = new THREE.Vector3( 0, 1, 0 );
-    const zdir = new THREE.Vector3( 0, 0, 1 );
-    const origin = new THREE.Vector3( 0, 0, 0, );
-    const length = 1.0;
-    const xAxis = new THREE.ArrowHelper( xdir, origin, length, 0xff0000, 0.2*length, 0.1*length );
-    const yAxis = new THREE.ArrowHelper( ydir, origin, length, 0x00ff00, 0.2*length, 0.1*length );
-    const zAxis = new THREE.ArrowHelper( zdir, origin, length, 0x0000ff, 0.2*length, 0.1*length );
-    scene.add( xAxis ); scene.add( yAxis ); scene.add( zAxis );
-
-    // camera, such that North East Down makes sense
-    camera.up.set( 0, 0, -1 ); // for orbit controls to make sense
-    camera.position.x = -4;
-    camera.position.y = 3;
-    camera.position.z = -3;
-    camera.setRotationFromEuler( new THREE.Euler(-110*3.1415/180, 0, 55 * 3.1415/180, 'ZYX'))
-
-}
-
+var clock = new THREE.Clock();
 
 function updateVisualization(data) {
     if (!idList.includes(data.id)) {
-        // never seen this is, add new quadrotor to scene
+        // never seen this id, add new quadrotor to scene
         idList.push(data.id);
-        var newQuadrotor = new quadRotor(0.1, 0.06, 0.07);
+        var newQuadrotor = new quadRotor(0.08, 0.06, 0.07);
         craftList.push(newQuadrotor);
         newQuadrotor.addToScene(scene);
     }
@@ -113,13 +87,24 @@ function updateVisualization(data) {
 }
 
 function animate() {
+    stats.begin()
+
 	requestAnimationFrame( animate );
-    controls.update();
+
+    const delta = clock.getDelta();
+    if ( viewHelper.animating ) viewHelper.update( delta );
+
+    renderer.clear();
 	renderer.render( scene, camera );
+    viewHelper.render( renderer );
+
+    stats.end()
 }
 
 function startWebsocket() {
   socket = new WebSocket('ws://localhost:8765');
+
+  if (socket === null) { return; }
 
   socket.onopen = function(event) {
       console.log('WebSocket connection established.');
@@ -131,16 +116,7 @@ function startWebsocket() {
       updateVisualization(data);
   };
 
-  socket.onclose = function(){
-    // connection closed, discard old websocket and create a new one in 5s
-    socket = null;
-    //setTimeout(startWebsocket, 200);
-  }
-
-  socket.onerror = function(err) {
-    //console.error('Socket encountered error: ', err.message, 'Closing socket');
-    socket.close();
-  };
+  socket.onclose = function(){ socket = null; }
 }
 
 function retryConnection() {
@@ -158,24 +134,53 @@ var craftList = []
 //startWebsocket();
 retryConnection();
 
-const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera( 60, window.innerWidth / window.innerHeight, 0.1, 1000 );
-
-dressUpScene(scene, camera);
 
 // webGL renderer
-const renderer = new THREE.WebGLRenderer();
+const renderer = new THREE.WebGLRenderer( { antialias: true } );
 renderer.setSize( window.innerWidth, window.innerHeight );
+renderer.autoClear = false;
 document.body.appendChild( renderer.domElement )
 
+// scene with white background
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xffffff);
+
+// camera, such that North East Down makes sense
+const camera = new THREE.PerspectiveCamera( 40, window.innerWidth / window.innerHeight, 0.1, 1000 );
+camera.up.set( 0, 0, -1 ); // for orbit controls to make sense
+camera.position.x = -6;
+camera.position.y = 4;
+camera.position.z = -3;
+camera.setRotationFromEuler( new THREE.Euler(-110*3.1415/180, 0, 55 * 3.1415/180, 'ZYX'))
+
+window.onresize = function() {
+    var margin = 35;
+    camera.aspect = (window.innerWidth-margin) / (window.innerHeight-margin);
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth-margin, window.innerHeight-margin);
+};
+
+// ground plane grid in the xy-plane and coordinate system stems
+const gd = new THREE.GridHelper( 10, 10 );
+gd.rotation.x = -0.5*3.1415
+scene.add( gd );
+scene.add( new THREE.AxesHelper ( 0.75 ));
+
+// interactive camera controls and triad in the corner
 const controls = new OrbitControls( camera, renderer.domElement );
+document.addEventListener('keydown', function(event) { // reset view on space
+    if (event.code === 'Space') { controls.reset(); } });
+var viewHelper = new ViewHelper( camera, renderer.domElement );
+viewHelper.controls = controls;
+viewHelper.controls.center = controls.target;
+window.onpointerup = function (event) { // enable clicking of the triad
+    viewHelper.handleClick( event ) };
+
+window.onresize() // call once
+
+// performance counter in top left
+const stats = new Stats()
+stats.showPanel(0) // 0: fps, 1: ms, 2: mb, 3+: custom
+document.body.appendChild(stats.dom)
 
 animate();
-
-document.addEventListener('keydown', function(event) {
-    // Check if the space bar is pressed
-    if (event.code === 'Space') {
-        // Reset OrbitControls state
-        controls.reset();
-    }
-});
