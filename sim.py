@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
     Vectorized quadrotor simulation with websocket pose output
 
@@ -21,369 +20,184 @@
 
 import numpy as np
 import numba as nb
-from math import sqrt, acos, hypot
+from tqdm import tqdm
+import asyncio
+from time import time
+from libs.wsInterface import wsInterface, dummyInterface
+from crafts import QuadRotor, Rotor
 GRAVITY = 9.80665
 
-### data
 
-# todo list
-# 1. benchmark SIMD (and contiguous arrays)
-#     --> contiguity can save around half the time, even in simple cases
-# 2. benchmark np.jit called from np.cuda.jit
-#     --> nb.jit doesnt work with an error no one on the internet has seen
-#     --> calling nb.cuda.jit(..., device=True) from a Kernel works like a charm
-# 3. adapt sim for cuda
-# 4. make class to get G1/G2 from system parameters
-# 5. investiage why first run is slow in CUDA
-#     --> this happens when a function signature isnt passed
+#%% sim config
+gpu = True              # run on the GPU using cuda
+viz = True              # stream pose to a websocket connection
+log = True              # log states from GPU back to the CPU (setting False has no speedup on CPU)
+position_control = True # use a simple position/attitude NDI controller
+realtime = False         # wait every timestep to try and be real time
 
-# sim data
-N = 256 # run N simulations in parallel
-dt = 0.002 # step time is dt seconds (forward Euler)
+# length / number of parallel sims
+dt = 0.01 # step time is dt seconds (forward Euler)
 T = 10  # run for T seconds
+if gpu: # number of simulations to run in parallel
+    blocks = 128 # 128 or 256 seem best. Should be multiple of 32
+    threads_per_block = 64 # depends on global memorty usage. 256 seems best without. Should be multiple of 64
+    # dt 0.01, T 10, no viz, log_interval 0, no controller, blocks 256, threads 256, gpu = True --> 250M ticks/sec
+    N = blocks * threads_per_block
+else:
+    N = 100 # cpu
 
-# drone data
-omegaMaxs = np.tile(np.array(
-    [4000., 4000., 4000., 4000.], dtype=np.float32), (N, 1)) \
-    + np.random.random((N, 4)).astype(np.float32)
-taus = np.tile(np.array(
-    [0.03, 0.03, 0.03, 0.03], dtype=np.float32), (N, 1)) \
-    + np.random.random((N, 4)).astype(np.float32)*1e-3
-tausi = 1. / taus
-G1        = 1. / (4000.**2) * np.tile( np.array(
-    [
-        [0.,0.,0.,0.],
-        [0.,0.,0.,0.],
-        [-8.,-8.,-8.,-8.],
-        [-300.,-300.,300.,300.],
-        [-200.,+200.,-200.,+200.],
-        [-50.,+50.,+50.,-50.],
-    ], dtype=np.float32), (N,1,1)) + (np.random.random((N, 6, 4)).astype(np.float32) * 1e-8)
-G2        = 1e-5 * np.tile(np.array(
-    [
-        [0.,0.,0.,0.],
-        [0.,0.,0.,0.],
-        [0.,0.,0.,0.],
-        [0.,0.,0.,0.],
-        [0.,0.,0.,0.],
-        [-50.,+50.,+50.,-50.],
-    ], dtype=np.float32), (N,1,1)) + (np.random.random((N, 6, 4)).astype(np.float32) * 1e-5)
+# initial states: 0:3 pos, 3:6 vel, 6:10 quaternion, 10:13 body rates Omega, 13:17 motor speeds omega
+x0 = np.random.random((N, 17)).astype(np.float32) - 0.5
+x0[:, 6:10] /= np.linalg.norm(x0[:, 6:10], axis=1)[:, np.newaxis] # quaternion needs to be normalized
 
-# position setpoints
+# other settings
+viz_interval = 0.05 # visualize every viz_interval simulation-seconds
+Nviz = 512 # max number of quadrotors to visualize
+log_interval = 1    # log state every x iterations. Too low may cause out_of_memory on the GPU. False == 0
+
+
+#%% drone data
+G1s = np.empty((N, 4, 4), dtype=np.float32)
+G2s = np.empty((N, 1, 4), dtype=np.float32)
+omegaMaxs = np.empty((N, 4), dtype=np.float32)
+taus = np.empty((N, 4), dtype=np.float32)
+
+for i in tqdm(range(N), desc="Building crafts"):
+    q = QuadRotor()
+    q.setInertia(0.42, 1e-3*np.eye(3))
+    q.rotors.append(Rotor([-0.1, 0.1, 0], dir='cw'))
+    q.rotors.append(Rotor([0.1, 0.1, 0], dir='ccw'))
+    q.rotors.append(Rotor([-0.1, -0.1, 0], dir='ccw'))
+    q.rotors.append(Rotor([0.1, -0.1, 0], dir='cw'))
+
+    q.fillArrays(i, G1s, G2s, omegaMaxs, taus)
+
+# precompute stuff
+itaus = 1. / taus
+
+
+#%% controller data
+# (FIXME: should be a weighted pseudoinverse!!)
+G1pinvs = np.linalg.pinv(G1s) / (omegaMaxs*omegaMaxs)[:, :, np.newaxis]
+
+# position setpoints --> uniform on rectangular grid
 grid_size = int(np.ceil(np.sqrt(N)))
-x_vals = np.linspace(-3, 3, grid_size)
-y_vals = np.linspace(-3, 3, grid_size)
-
+x_vals = np.linspace(-7, 7, grid_size)
+y_vals = np.linspace(-7, 7, grid_size)
 X, Y = np.meshgrid(x_vals, y_vals)
-
 vectors = np.column_stack((X.ravel(), Y.ravel(), -1.5*np.ones_like(X.ravel())))
-
 pSets = vectors[:N].astype(np.float32)
 
 # position controller gains (attitude/rate hardcoded for now, sorry)
-posP = 2*np.ones((N, 3), dtype=np.float32)
-velP = 2*np.ones((N, 3), dtype=np.float32)
-#velI = 0.1*np.ones((N, 3), dtype=np.float32) # not implemented yet
-#velIlimit = np.ones((N, 3), dtype=np.float32)
-#velEI = np.zeros((N, 3), dtype=np.float32)
+posPs = 2*np.ones((N, 3), dtype=np.float32)
+velPs = 2*np.ones((N, 3), dtype=np.float32)
 
 
-### Numba stuff
-
-def dummy_decorator(f=None, *args, **kwargs):
-    def decorator(func):
-        return func
-
-    if callable(f):
-        return f
-    else:
-        return decorator
-
-vectorize = lambda signature, map: nb.guvectorize(signature, map, target='parallel', nopython=True)
-jit = lambda signature: nb.jit(signature, nopython=True, fastmath=False)
-nb.set_num_threads(max(nb.config.NUMBA_DEFAULT_NUM_THREADS-4, 1))
-#jit = lambda signature: nb.cuda.jit(signature)
-
-#vectorize = dummy_decorator
-#jit = dummy_decorator
+#%% import compute kernels
+if gpu:
+    from numba import cuda
+    jitter = lambda signature: nb.cuda.jit(signature, fastmath=False, device=True, inline=False)
+    kerneller = lambda signature: nb.cuda.jit(signature, fastmath=False, device=False)
+    from libs.gpuKernels import step, controller
+else:
+    jitter = lambda signature: nb.jit(signature, nopython=True, fastmath=False)
+    kerneller = lambda signature, map: nb.guvectorize(signature, map, target='parallel', nopython=True, fastmath=False)
+    nb.set_num_threads(max(nb.config.NUMBA_DEFAULT_NUM_THREADS-4, 1))
+    from libs.cpuKernels import step, controller
 
 
-### precompute
+#%% allocate sim data
+log_interval = log*5
+iters = int(T / dt)
+Nlog = int(iters / log_interval) if log_interval > 0 else 0
 
-#G1pinv = np.linalg.pinv(G1)
-G1pinv = np.linalg.pinv(G1) / (omegaMaxs*omegaMaxs)[:, :, np.newaxis]
+xs = x0.copy()
+us = np.random.random((N, 4)).astype(np.float32)
 
-
-### states
-x = np.empty((N, 17), dtype=np.float32)
-xDot = np.zeros_like(x, dtype=np.float32)
-
-
-### functions
-
-@vectorize([(nb.float32[:], nb.float32, nb.float32[:])],
-           "(states),(),(states)")
-def step(xdot, dt, x):
-    #x = x + dt * xdot
-    for i in range(x.size):
-        x[i] = x[i] + dt * xdot[i]
-
-    ni = 1. / sqrt(x[6]**2 + x[7]**2 + x[8]**2 + x[9]**2)
-    for i in range(6,10):
-        x[i] *= ni
-
-@jit("void(i4,f4[:],f4[:],f4[:])")
-def motorDot(i, w, d, wDot):
-    wmax = omegaMaxs[i]
-    taui = tausi[i]
-    #wDot[:] = (d*wmax - w) / tau
-    for j in range(len(w)):
-        d[j] = 0. if d[j] < 0. else 1. if d[j] > 1. else d[j] 
-        wDot[j] = (sqrt(d[j])*wmax[j] - w[j]) * taui[j]
-
-@jit("void(i4,f4[::1],f4[::1],f4[::1])")
-def forcesAndMoments(i, omega, omegaDot, fm):
-    o2 = omega.copy()
-    for j in range(omega.size):
-        o2[j] *= omega[j]
-
-    fm[:] = G1[i] @ o2   +   G2[i] @ omegaDot
-
-@jit("void(f4[::1], f4[::1], f4[::1])")
-def cross(u, v, w):
-    w[0] = u[1]*v[2] - u[2]*v[1]
-    w[1] = u[2]*v[0] - u[0]*v[2]
-    w[2] = u[0]*v[1] - u[1]*v[0]
-
-@jit("void(f4[::1],f4[::1])")
-def quatRotate(q, v):
-    #w, x, y, z = q
-
-    ## Construct quaternion matrix --> unchecked chatGPT code now
-    #rotM = np.array([
-    #    [1 - 2*(y**2 + z**2),   2*(x*y - w*z),         2*(x*z + w*y)],
-    #    [2*(x*y + w*z),         1 - 2*(x**2 + z**2),   2*(y*z - w*x)],
-    #    [2*(x*z - w*y),         2*(y*z + w*x),         1 - 2*(x**2 + y**2)]
-    #], dtype=np.float32)
-
-    #v[:] = rotM @ v
-
-    # crazy algorithm due to Fabian Giesen (A faster quaternion-vector multiplication)
-    t  = np.empty(3, dtype=np.float32)
-    t2 = np.empty(3, dtype=np.float32)
-    cross(2*q[1:], v, t)
-    cross(q[1:], t, t2)
-
-    v[:] +=  q[0] * t  +  t2
-
-@jit("void(f4[::1],f4[::1],f4[::1])")
-def quatDot(q, O, qDot):
-    Ox, Oy, Oz = O
-    qw, qx, qy, qz = q
-    qDot[0] = .5 * (-Ox*qx - Oy*qy - Oz*qz)
-    qDot[1] = .5 * ( Ox*qw + Oz*qy - Oy*qz)
-    qDot[2] = .5 * ( Oy*qw - Oz*qx + Ox*qz)
-    qDot[3] = .5 * ( Oz*qw + Oy*qx - Ox*qy)
+xs_log = np.empty(
+    (N, Nlog, 17), dtype=np.float32)
+xs_log[:] = np.nan
 
 
-@vectorize([(nb.int32, nb.float32[:], nb.float32[:], nb.float32[:])],
-                   '(),(states),(n),(states)')
-def Dot(i, x, d, xDot):
-    pos   = x[0:3].copy()
-    vel   = x[3:6].copy()
-    q     = x[6:10].copy()
-    Omega = x[10:13].copy()
-    omega = x[13:17].copy()
+if viz:
+    print("initializing websocket. Awaiting connection... ")
+    wsI = wsInterface(8765)
+else:
+    wsI = dummyInterface()
 
-    # forces
-    omegaDot = np.zeros_like(omega, dtype=np.float32)
-    motorDot(i, omega, d, omegaDot)
-
-    fm = np.zeros(6, dtype=np.float32)
-    forcesAndMoments(i, omega, omegaDot, fm)
-
-    ## kinematics
-    qDot = np.zeros_like(q, dtype=np.float32)
-    quatDot(q, Omega, qDot)
-
-    acc = fm[:3].copy()
-    quatRotate(q, acc)
-
-    ## assign
-    xDot[13:17] = omegaDot
-    xDot[10:13] = fm[3:].copy()
-    xDot[6:10] = qDot
-    xDot[3:6] = acc
-    xDot[5] += GRAVITY
-    xDot[0:3] = vel
-
-@vectorize([(nb.int32, nb.float32[:], nb.float32[:])],
-                   '(),(states),(n)')
-def Controller(i, x, d):
-    pos = x[:3].copy()
-    vel = x[3:6].copy()
-
-    velSp = posP[i] * (pSets[i] - pos)
-    velE = velSp - vel
-    #velEI[i][:] = np.clip(velEI[i] + velE, -velIlimit[i], velIlimit[i])
-
-    accSp = velP[i]*velE# + velI[i]*velEI[i]
-
-    qi = x[6:10].copy()
-    qi[0] = -qi[0]
-
-    fsp = accSp - np.array([0, 0, GRAVITY], dtype=np.float32)
-    quatRotate(qi, fsp)
-
-    fzsp = np.linalg.norm(fsp)
-    if (fzsp < 1e-5):
-        # we are supposed to be falling, don't control attitude
-        tiltE = np.array([0., 0., 0.], dtype=np.float32)
-        cosTilt = 1.
-    else:
-        fsp /= fzsp
-
-        tilt = np.array([-fsp[1], fsp[0], 0.], dtype=np.float32)
-
-        sinTilt = hypot(fsp[0], fsp[1])
-        cosTilt = -fsp[2] # dot prodict 
-        if (sinTilt < 1e-5):
-            # either we are aligned with attitude set or 180deg away
-            if (cosTilt > 0):
-                # aligned
-                tiltE = np.array([0., 0., 0.], dtype=np.float32)
-            else:
-                # 180 deg
-                tiltE = np.array([np.pi, 0., 0.], dtype=np.float32)
-        else:
-            tiltE = tilt / sinTilt * acos(cosTilt)
-
-    OmegaSp = -10. * tiltE
-    OmegaE = OmegaSp - x[10:13].copy()
-    OmegaDotSp = 20. * OmegaE
-
-    fspBody = cosTilt * np.array([0., 0., -fzsp], dtype=np.float32)
-    fspBody[2] = 0. if fspBody[2] > 0. else fspBody[2]
-    v = np.array([fspBody[0], fspBody[1], fspBody[2],
-                  OmegaDotSp[0], OmegaDotSp[1], OmegaDotSp[2]], dtype=np.float32)
-    #G1u = G1u * omegaMaxs[i]**2
-    #d[:] = np.linalg.pinv(G1u) @ v
-    G1pinvu = G1pinv[i]# / (omegaMaxs[i]*omegaMaxs[i])[:, np.newaxis]
-    d[:] = G1pinvu @ v
-    for j in range(len(d)):
-        d[j] = 0. if d[j] < 0. else 1. if d[j] > 1. else d[j]
-
-
-### websocket stuff
-ws = None
-
-import asyncio
-import websockets
-import json
-from time import time
-async def handle_client(websocket, path):
-    # Send data to the client
-    global ws
-    ws = websocket
-    while True:
-        await asyncio.Future() # run forever without blokcing?
-
-async def start_server():
-    # Start WebSocket server
-    async with websockets.serve(handle_client, "localhost", 8765):
-        await asyncio.Future()  # run forever
-
-async def mainDebug():
-    # if the dummy decorators are used, use this main.
-    # Nice for debugging, as it only runs a single sim without numba jit compiling
-
-    # havent run this function in a while, may be buggy now
-
-    x0 = np.zeros(17).astype(np.float32);
-    #x0[6:10] = np.random.random(4) - 0.5
-    x0[2] = -1.5
-    x0[6] = 1.
-    x0[7] = 0.
-    x0[6:10] /= np.linalg.norm(x0[6:10])
-    x[0, :] = x0.copy()
-
-    coro = start_server()
-    asyncio.create_task(coro)
-    await asyncio.sleep(1)
-
-    d = np.zeros((N, 4), dtype=np.float32)
-
-    i = 0
-    while True:
-        Controller(0, x[0], d[0])
-        Dot(0, x[0], d[0], xDot[0])
-        step(xDot[0], dt, x[0])
-
-        if ws is not None and not i % int(0.1/dt):
-            data = {"id": 0, "pos": list(x[0, :3]), "quat": list(x[0, 6:10])}
-            await ws.send(json.dumps(data))
-
-        i += 1
-        print(i)
-        await asyncio.sleep(0.1)
-
-ts = 0
-
-from ipdb import set_trace
-
-np.random.seed(42)
-x0 = np.random.random((N, 17)).astype(np.float32) - 0.5
-
+#%% loop
+ep = 0
 async def main():
-#def main():
-    x0[:, :3] = 0.
-    x0[:, 3:6] = 0.
-    #x0[:, 6] = 1.
-    #x0[:, 7:10] = 0.
-    x0[:, 6:10] /= np.linalg.norm(x0[:, 6:10], axis=1)[:, np.newaxis]
-    x0[:, 10:13] = 0.
-    x0[:, 13:17] = 0.
+    async with wsI as ws:
+        tsAll = time()
 
-    x[:] = x0.copy()
-    xDot = np.zeros_like(x, dtype=np.float32)
+        if gpu:
+            d_us = cuda.to_device(us)
+            d_xs = cuda.to_device(xs)
+            d_xs_log = cuda.to_device(xs_log)
+            d_itaus = cuda.to_device(itaus)
+            d_omegaMaxs = cuda.to_device(omegaMaxs)
+            d_G1s = cuda.to_device(G1s)
+            d_G2s = cuda.to_device(G2s)
 
-    idxs = np.arange(N, dtype=np.int32)
+            d_posPs = cuda.to_device(posPs)
+            d_velPs = cuda.to_device(velPs)
+            d_pSets = cuda.to_device(pSets)
+            d_G1pinvs = cuda.to_device(G1pinvs)
+            cuda.synchronize()
+
+        ts = time()
+        ei = 0
+        iters = int(T / dt)
+        for i in tqdm(range(iters), desc="Running simulation"):
+            if realtime:
+                t = time()
+
+            log_idx = -1
+            if (log_interval > 0) and not (i % log_interval):
+                log_idx = int(i / log_interval)
+
+            if gpu:
+                step[blocks,threads_per_block](d_xs, d_us, d_itaus, d_omegaMaxs, d_G1s, d_G2s, dt, log_idx, d_xs_log)
+            else:
+                step(xs, us, itaus, omegaMaxs, G1s, G2s, dt, log_idx, xs_log)
+
+            if position_control:
+                if gpu:
+                    controller[blocks,threads_per_block](d_xs, d_us, d_posPs, d_velPs, d_pSets, d_G1pinvs)
+                else:
+                    controller(xs, us, posPs, velPs, pSets, G1pinvs)
+
+            if viz  and  ws.ws is not None  and  not i % int(viz_interval/dt):
+                # visualize every 0.1 seconds
+                if gpu:
+                    xs[:] = d_xs.copy_to_host()
+                await ws.sendData(xs[::int(np.ceil(N/Nviz))].astype(np.float64))
+
+            if realtime:
+                global ep, e
+                te = time()
+                e = dt - ( te - t )
+                ep = dt - ( te - ts ) / ( i + 1 )
+                ei += ep
+                #print(e, ep)
+                await asyncio.sleep( max(0.01*ei + 10*ep + e, 0) )
 
 
-    coro = start_server()
-    asyncio.create_task(coro)
-    print("initialized websocket")
-    await asyncio.sleep(2)
+        # make sure all threads complete before stopping the count
+        if gpu:
+            cuda.synchronize()
 
-    d = np.random.random((N, 4)).astype(np.float32)
-    d[:] = 0
+        runtime = time() - ts
 
-    global ts
-    ts = time()
-    for i in range(int(T / dt)):
-        tStart = time()
+        if gpu and (log_interval > 0):
+            xs_log[:] = d_xs_log.copy_to_host()
 
-        Dot(idxs, x, d, xDot)
-        step(xDot, dt, x)
-        Controller(idxs, x, d)
-        set_trace()
+        runtimeOverhead = time() - tsAll
 
-        if ws is not None and not i % int(0.1/dt):
-            j = 0
-            for xD in x.astype(np.float64):
-                data = {"id": j, "pos": list(xD[:3]), "quat": list(xD[6:10])}
-                #data = {"id": i, "pos": [1,2,3.], "quat": [1., 0., 0., 0.]}
-                j += 1;
-                await ws.send(json.dumps(data))
+    return runtime, runtimeOverhead
 
-        dtReal = time() - tStart
-        e = dt - dtReal
-        #sleep(max(e, 0))
+runtime, runtimeOverhead = asyncio.run(main())
 
-
-#asyncio.run(mainDebug())
-asyncio.run(main())
-#main()
-runtime = time() - ts
-
-print(f"Achieved {N*T / dt / runtime / 1e6:.2f}M ticks per second.")
+print(f"Achieved {N*iters / runtime / 1e6:.2f}M ticks per second (sim only) across {runtime:.5f} seconds.")
+print(f"Retrieved {Nlog*N / runtimeOverhead / 1e6:.2f}M datapoints per (sim plus overhead) second across {runtimeOverhead:.5f} seconds.")

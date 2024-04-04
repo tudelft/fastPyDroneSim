@@ -121,7 +121,7 @@ function startWebsocket() {
 
 function retryConnection() {
     if ((socket === null) || (socket.readyState != 1)) {
-        console.log('(Re)trying WebSocket connection...');
+        //console.log('(Re)trying WebSocket connection...');
         startWebsocket();
     }
     setTimeout(retryConnection, 500);

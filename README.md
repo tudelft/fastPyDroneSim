@@ -16,7 +16,10 @@
 -->  
 
 Fast drone sim in python (currently linear quadrotors only). Vectorized on CPU
-cranking about 6M timesteps on a laptop i7. GPU support via cuda planned.
+cranking about 5M timesteps per second on a laptop i7. 
+Also vectorized for GPU with up to 250M timesteps per second (RTX A1000), but if
+the state at every time step needs to be logged and be available to the CPU after simulation, then
+that number reduces to 20M or so.
 
 Visuals in THREE.js with a websocket connection, inspired by the Learning to Fly in Seconds paper (https://arxiv.org/abs/2311.13081).
 
@@ -52,17 +55,33 @@ Python dependencies can be installed with:
 
     pip install -r requirements.txt
 
-<!--
+
+### CUDA
+
+Cuda can be a hassle to install. For Ubuntu 22.04 on my machine, the following
+worked, but there may be easier ways with different combinations of versions.
+
 Supported for Ubuntu 22.04.
 
-Do the "Base Installer" step of https://developer.nvidia.com/cuda-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=22.04&target_type=deb_network
+- Delete all current nvidia things `sudo apt purge "nvidia-*" "libnvidia-*" "cuda-*" "linux-modules-nvidia-*"`
+- `sudo apt autoremove`
+- Make sure that "Using X.Org X server" is selected in "Software & Updates" > "Additional Drivers"
+- Compile the latests 550 driver from scratch for your kernel (`6.1.0-1036-oem` in my case)
+```
+sudo apt install gcc-12
+sudo update-alternatives --install  /usr/bin/cc cc /usr/bin/x86_64-linux-gnu-gcc-12 100
+```
+- download the runscript from https://www.nvidia.com/download/driverResults.aspx/218826/en-us/. Terminate x-server and run
+```
+chmod +x ./NVIDIA-Linux-x86_64-550.54.14.run
+sudo ./NVIDIA-Linux-x86_64-550.54.14.run        # say yes to everything
+```
 
-    sudo apt purge nvidia-driver-*
-    sudo apt install nvidia-driver-550-open cuda-drivers-550
+- reboot and do ONLY the "Base Installer" step of https://developer.nvidia.com/cuda-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=22.04&target_type=deb_network
+- finally, install cuda and some other things
 
+    sudo apt install cuda-driver-550 nvidia-compute-utils-550
 
-pip install 
--->
 
 
 
@@ -97,15 +116,16 @@ Build docker image of the webserver for the visuals
 
 Run it with
 
-    docker run -it --net host -v ./static:/usr/app/static webserver
+    docker run -it --net host -v ./static:/usr/app/static devserver
 
 Open the URL reported by the docker container in a WebGL capable browser.
 
 
 ### Simulation
 
-    ./sim.py
+    ipython -i sim.py
 
+Check options at the top of `sim.py` for configuration.
 
 
 
