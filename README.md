@@ -23,9 +23,12 @@ that number reduces to 20M or so.
 
 Visuals in THREE.js with a websocket connection, inspired by the Learning to Fly in Seconds paper (https://arxiv.org/abs/2311.13081).
 
-## History
+<img src="docs/512quadRotors.gif" width="768">512 quadrotors displayed at the same time</img>
+This gif shows the visualization of 512 quadrotors, although 8192 were simulated on a RTX A1000 graphics card.
 
 <!--- Provide a changelog (if applicable)  
+## History
+
 -->
 
 
@@ -36,13 +39,13 @@ Visuals in THREE.js with a websocket connection, inspired by the Learning to Fly
     * Full name ([@GitHub username](https://github.com/username), [ORCID](https://doi.org/...), email address, institution/employer (role)  
 -->
 
-Till Blaha - [@tblaha](https://github.com/tblaha]
+Till Blaha - [@tblaha](https://github.com/tblaha)
 
 
-
-## Table of Contents
 
 <!--- Provide a table of contents to help readers navigate the README  
+## Table of Contents
+
 -->
 
 
@@ -59,9 +62,7 @@ Python dependencies can be installed with:
 ### CUDA
 
 Cuda can be a hassle to install. For Ubuntu 22.04 on my machine, the following
-worked, but there may be easier ways with different combinations of versions.
-
-Supported for Ubuntu 22.04.
+worked, but there may be (must be!) easier ways, perhaps with a different version.
 
 - Delete all current nvidia things `sudo apt purge "nvidia-*" "libnvidia-*" "cuda-*" "linux-modules-nvidia-*"`
 - `sudo apt autoremove`
@@ -80,9 +81,9 @@ sudo ./NVIDIA-Linux-x86_64-550.54.14.run        # say yes to everything
 - reboot and do ONLY the "Base Installer" step of https://developer.nvidia.com/cuda-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=22.04&target_type=deb_network
 - finally, install cuda and some other things
 
-    sudo apt install cuda-driver-550 nvidia-compute-utils-550
-
-
+```
+sudo apt install cuda-driver-550 nvidia-compute-utils-550
+```
 
 
 <!--- Add badges of requirements e.g.:  
@@ -134,7 +135,18 @@ Check options at the top of `sim.py` for configuration.
 <!--- Add here the directory structure of the repo, including file/directory naming conventions  
 -->
 
-
+```
+.
+├── benchmarks/  # unrelated code for testing numba/cuda
+├── libs/        # math functions, compute kernels and visualization interface
+├── static/      # the visualization frontend code
+├── dockerfile   # sets up a Vite development webserver to host the visuals
+├── crafts.py    # contains the drone definitions (currently only quadrotor)
+├── sim.py       # simulation main function
+├── LICENSE
+├── README.md
+└── requirements.txt
+```
 
 ## License
 
@@ -178,7 +190,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 <!--- Provide links to applicable references    
 --> 
-
+Eschmann, Albani and Loianno, "Learning to Fly in Seconds", 2023, [arXiv 2311.13081](https://arxiv.org/abs/2311.13081)
 
 
 ## Citation
