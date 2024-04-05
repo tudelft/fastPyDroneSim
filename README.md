@@ -24,6 +24,7 @@ that number reduces to 20M or so.
 Visuals in THREE.js with a websocket connection, inspired by the Learning to Fly in Seconds paper (https://arxiv.org/abs/2311.13081).
 
 <img src="docs/512quadRotors.gif" width="768">512 quadrotors displayed at the same time</img>
+
 This gif shows the visualization of 512 quadrotors, although 8192 were simulated on a RTX A1000 graphics card.
 
 <!--- Provide a changelog (if applicable)  
