@@ -22,6 +22,16 @@ import numpy as np
 
 class Rotor:
     def __init__(self, x=[0., 0., 0.], wmax=4000., Tmax=4., k=0., cm=0.01, tau=0.03, Izz=1e-6, dir='cw'):
+        '''
+        x: position of the rotor in the body frame
+        wmax: maximum angular velocity
+        Tmax: maximum thrust
+        k: thrust coefficient
+        cm: moment arm
+        tau: time constant
+        Izz: moment of inertia
+        dir: direction of rotation
+        '''
         self.x = np.asarray(x)
         self.wmax = wmax
         self.Tmax = Tmax

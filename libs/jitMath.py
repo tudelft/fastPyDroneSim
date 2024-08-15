@@ -17,7 +17,9 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
-from __main__ import jitter
+# from gym_sim import jitter
+from gym_sim import jitter
+
 
 @jitter("void(f4[:, ::1], f4[::1], f4[::1])")
 def sgemv(A, x, b):
@@ -84,6 +86,9 @@ def motorDot(w, d, itau, wmax, wDot):
         #dLim = 0. if d[j] < 0. else 1. if d[j] > 1. else d[j]
         #wDot[j] = (sqrt(dLim)*wmax[j] - w[j]) * itau[j]
         wDot[j] = (sqrt( d[j] )*wmax[j] - w[j]) * itau[j]
+        # wDot[j] = (( d[j] )*wmax[j] - w[j]) * itau[j]
+        # in OG sim: state_change.rpm[i_rotor] = (action[i_rotor] - state.rpm[i_rotor]) * 1/params.dynamics.rpm_time_constant;
+        # where the action is in rpm (scaled)
 
 @jitter("void(f4[::1], f4[::1], f4[:, ::1], f4[:, ::1], f4[::1], f4[::1])")
 def forcesAndMoments(omega, omegaDot, G1, G2, fm, workspace):
@@ -93,5 +98,9 @@ def forcesAndMoments(omega, omegaDot, G1, G2, fm, workspace):
     fm[0] = 0.
     fm[1] = 0.
     sgemv(G1, workspace[:4], fm[2:])
+    # should this be:
+    # T thrust_magnitude = params.dynamics.thrust_constants[0] + params.dynamics.thrust_constants[1] * rpm + params.dynamics.thrust_constants[2] * rpm * rpm;
+
+    # NOTE: thrust_constants[2] is teh only non zero so we are good in that regard
     sgemv_add(G2, omegaDot, fm[5:])
 

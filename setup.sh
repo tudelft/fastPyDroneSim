@@ -1,0 +1,1 @@
+conda env create --name thesis_korneel --file=setup_files/environment.yml
